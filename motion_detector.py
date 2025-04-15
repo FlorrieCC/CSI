@@ -4,12 +4,13 @@ from collections import deque
 import os
 
 class MotionDetector:
-    def __init__(self, window_size=30, threshold=3.0):
+    def __init__(self, window_size=100, threshold=4.0):
         self.window = deque(maxlen=window_size)
         self.threshold = threshold
         self.last_state = None
         self.expected_len = None
         self.std_list = []  
+        self.counter = 0  
 
 
     def update(self, csi_line: str):
@@ -29,7 +30,9 @@ class MotionDetector:
 
             self.window.append(amplitude)
 
-            if len(self.window) == self.window.maxlen:
+            self.counter += 1
+            if len(self.window) == self.window.maxlen and self.counter >= 50:
+                self.counter = 0  # reset counter after processing a full window
                 # print("window full!!!!!!!!!")
                 window_array = np.stack(self.window)
                 std = np.std(window_array, axis=0).mean()
@@ -39,7 +42,7 @@ class MotionDetector:
                 return motion_detected
             else:
                 # print("window not full😡😠")
-                return None  # 窗口未满时默认返回 False（你也可以改成 None）
+                return None  # not enough data to determine motion
         except Exception as e:
             print(f"[MotionDetector Error] {e}")
             return False
@@ -50,7 +53,7 @@ def read_csi_data_from_csv(file_path):
     return df['data'].tolist()
 
 def main():
-    dir_path = "/Users/yvonne/Documents/AIOT/comp7310_2025_group_project/benchmark/motion_detection/evaluation_static"
+    dir_path = "/Users/yvonne/Documents/AIOT/comp7310_2025_group_project/benchmark/motion_detection/evaluation_motion"
 
     for file_name in sorted(os.listdir(dir_path)):
         if file_name.endswith(".csv"):
@@ -58,7 +61,7 @@ def main():
             print(f"\n📂 Processing file: {file_name}")
 
             csi_lines = read_csi_data_from_csv(file_path)
-            motion_detector = MotionDetector(window_size=30, threshold=2)
+            motion_detector = MotionDetector(window_size=100, threshold=4.0)
 
             true_count = 0
             total_count = 0

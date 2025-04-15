@@ -38,6 +38,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include "nvs_flash.h"
 #include "esp_mac.h"
 #include "rom/ets_sys.h"
@@ -48,16 +51,17 @@
 #include "mqtt_client.h"
 
 
+
 // [1] YOUR CODE HERE
-#define CSI_BUFFER_LENGTH 400
-#define CSI_FIFO_LENGTH 100
-static int16_t CSI_Q[CSI_BUFFER_LENGTH];
+#define CSI_BUFFER_LENGTH (57 * 400) // 114 subcarriers, 800 samples
+#define CSI_FIFO_LENGTH  57
+static float CSI_Q[CSI_BUFFER_LENGTH];
 static int CSI_Q_INDEX = 0; // CSI Buffer Index
 // Enable/Disable CSI Buffering. 1: Enable, using buffer, 0: Disable, using serial output
 static bool CSI_Q_ENABLE = 1; 
 static void csi_process(const int8_t *csi_data, int length);
 static esp_mqtt_client_handle_t mqtt_client = NULL;
-static bool mqtt_ready = false; // MQTT connection status
+static bool mqtt_ready = false; 
 // [1] END OF YOUR CODE
 
 
@@ -68,13 +72,15 @@ static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
 {
     switch (event->event_id) {
         case MQTT_EVENT_CONNECTED:
-            mqtt_ready = true;
+            mqtt_ready = true; 
             ESP_LOGI("MQTT", "MQTT connected");
             break;
         case MQTT_EVENT_DISCONNECTED:
+            mqtt_ready = false;
             ESP_LOGI("MQTT", "MQTT disconnected");
             break;
         case MQTT_EVENT_ERROR:
+            mqtt_ready = false;
             ESP_LOGI("MQTT", "MQTT error");
             break;
         default:
@@ -109,20 +115,64 @@ void mqtt_app_start()
     esp_mqtt_client_start(mqtt_client);
 }
 
+
+#define WINDOW_SIZE 100
+#define FRAME_LEN 57
+#define NUM_SUBCARRIERS FRAME_LEN
+#define THRESHOLD 6
+#define STRIDE 50
+
+static const char *MOTION_TAG = "MotionDetect";
+static float amplitude_window[WINDOW_SIZE][NUM_SUBCARRIERS];
+static int stride_counter = 0;
+
 bool motion_detection() {
-    // TODO: Implement motion detection logic using CSI data in CSI_Q
-    return false; // Placeholder
+    int start_idx = CSI_Q_INDEX - FRAME_LEN * WINDOW_SIZE;
+    for (int w = 0; w < WINDOW_SIZE; w++) {
+        int base_idx = start_idx + w * FRAME_LEN;
+
+        for (int i = 0; i < NUM_SUBCARRIERS; i++) {
+            amplitude_window[w][i] = CSI_Q[base_idx + i];
+        }
+    }
+
+    float std_sum = 0.0f;
+    for (int i = 0; i < NUM_SUBCARRIERS; i++) {
+        float sum = 0.0f;
+        float sum_sq = 0.0f;
+        for (int j = 0; j < WINDOW_SIZE; j++) {
+            float val = amplitude_window[j][i];
+            sum += val;
+            sum_sq += val * val;
+        }
+        float mean = sum / WINDOW_SIZE;
+        float variance = (sum_sq / WINDOW_SIZE) - (mean * mean);
+        std_sum += sqrtf(variance);
+    }
+
+    float std_mean = std_sum / NUM_SUBCARRIERS;
+    ESP_LOGI(MOTION_TAG, "Motion std_mean: %.3f", std_mean);
+
+    if (std_mean > THRESHOLD) {
+        ESP_LOGW(MOTION_TAG, "🚶🚨 Motion Detected!");
+        return true;
+    } else {
+        ESP_LOGI(MOTION_TAG, "😴 No Motion Detected.");
+        return false;
+    }
 }
+
+
 
 int breathing_rate_estimation() {
     // TODO: Implement breathing rate estimation using CSI data in CSI_Q
     return 0; // Placeholder
 }
 
-void mqtt_send(const int8_t *csi_data, int length) {
+void mqtt_send(bool motion_result, int breathing_rate) {
     // TODO: Implement MQTT message sending using CSI data or Results
     // NOTE: If you implement the algorithm on-board, you can return the results to the host, else send the CSI data.
-    if (!mqtt_ready || !mqtt_client || !csi_data || length <= 0) return;
+    if (!mqtt_client || !mqtt_ready) return;
 
     // construct the CSV payload
     // char payload[2048]; 
@@ -136,12 +186,15 @@ void mqtt_send(const int8_t *csi_data, int length) {
     //     if (offset >= sizeof(payload) - 1) break;  // 防止溢出
     // }
 
-    const char *payload = "this is uu's esp32";
+    char payload[256];
+    snprintf(payload, sizeof(payload),
+                "{\"motion\": %d, \"breathing_rate\": %d}",
+                motion_result, breathing_rate);
 
+    // publish the message
+    int msg_id = esp_mqtt_client_publish(mqtt_client, "/esp32/csi", payload, 0, 1, 0);
+    ESP_LOGI("MQTT", "📤 MQTT sent: %s (msg_id=%d)", payload, msg_id);
 
-    // MQTT publish
-    int msg_id = esp_mqtt_client_publish(mqtt_client, "/esp32/csi", payload, 0, 0, 0);
-    ESP_LOGI("MQTT", "CSV payload sent, msg_id=%d, length=%d", msg_id, length);
 }
 
 
@@ -376,19 +429,24 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
 }
 
 //------------------------------------------------------CSI Processing & Algorithms------------------------------------------------------
+
 static void csi_process(const int8_t *csi_data, int length)
 {  
     if (CSI_Q_INDEX + length > CSI_BUFFER_LENGTH) {
         int shift_size = CSI_BUFFER_LENGTH - CSI_FIFO_LENGTH;
-        memmove(CSI_Q, CSI_Q + CSI_FIFO_LENGTH, shift_size * sizeof(int16_t));
+        memmove(CSI_Q, CSI_Q + CSI_FIFO_LENGTH, shift_size * sizeof(float));
         CSI_Q_INDEX = shift_size;
     }    
-    ESP_LOGI(TAG, "CSI Buffer Status: %d samples stored", CSI_Q_INDEX);
+   
     // Append new CSI data to the buffer
-    for (int i = 0; i < length && CSI_Q_INDEX < CSI_BUFFER_LENGTH; i++) {
-        CSI_Q[CSI_Q_INDEX++] = (int16_t)csi_data[i];
+    for (int i = 0; i + 1 < length && CSI_Q_INDEX < CSI_BUFFER_LENGTH; i += 2) {
+        int16_t imag = (int16_t)csi_data[i];
+        int16_t real = (int16_t)csi_data[i + 1];
+        float amplitude = sqrtf(imag * imag + real * real);
+        CSI_Q[CSI_Q_INDEX++] = amplitude;
     }
 
+    ESP_LOGI(TAG, "CSI Buffer Status: %d samples stored", CSI_Q_INDEX);
     // [4] YOUR CODE HERE
 
     // 1. Fill the information of your group members
@@ -402,8 +460,39 @@ static void csi_process(const int8_t *csi_data, int length)
 
     // 2. Call your algorithm functions here, e.g.: motion_detection(), breathing_rate_estimation(), and mqtt_send()
     // If you implement the algorithm on-board, you can return the results to the host, else send the CSI data.
-    // motion_detection();
-    // breathing_rate_estimation();
+    
+    int motion_result = -1;
+    int breathing_rate = -1; // -1 indicates no result
+
+    // Motion Detection Algorithm
+    
+
+    if (CSI_Q_INDEX >= FRAME_LEN * WINDOW_SIZE) {
+        stride_counter++;
+        if (stride_counter >= STRIDE) {
+            stride_counter = 0;
+            motion_result = motion_detection() ? 1 : 0;
+        } else {
+            ESP_LOGI(MOTION_TAG, "🕐 Waiting for stride (%d/%d)", stride_counter, STRIDE);
+        }
+    } else {
+        ESP_LOGW(MOTION_TAG, "Not enough CSI data for motion detection.");
+    }
+
+
+
+    // Breathing Rate Estimation Algorithm
+    //TODO:
+
+    // MQTT Sending
+    static int mqtt_counter = 0;
+    mqtt_counter++;
+    if (mqtt_counter >= 10) { 
+        mqtt_counter = 0;
+        mqtt_send(motion_result, breathing_rate); // Send the CSI data via MQTT
+        vTaskDelay(pdMS_TO_TICKS(10));  // Delay to allow for processing
+    }
+    
 
     // 3. Print the CSI data for debugging
     printf("CSI_DEBUG,len=%d,[%d", length, csi_data[0]);
@@ -412,8 +501,8 @@ static void csi_process(const int8_t *csi_data, int length)
     }
     printf("]\n");
 
-    mqtt_send(csi_data, length); // Send the CSI data via MQTT
-    vTaskDelay(pdMS_TO_TICKS(10));  // Delay to allow for processing
+    
+    
 
     // [4] END YOUR CODE HERE
 }
@@ -492,11 +581,6 @@ void app_main()
     if (wifi_connected) {
          // ================= MQTT initialize =================
          mqtt_app_start(); // Initialize MQTT Client
-         // ==== TEST MQTT SEND WITHOUT TX ====
-        //  ESP_LOGI(TAG, "Testing MQTT send with dummy CSI data...");
-        //  int8_t dummy_csi[64];
-        //  for (int i = 0; i < 64; i++) dummy_csi[i] = i;
-        //  mqtt_send(dummy_csi, 64);  // 直接触发一次 MQTT 发送
 
         // ================= ESP-NOW + CSI initialize =================
         esp_now_peer_info_t peer = {
